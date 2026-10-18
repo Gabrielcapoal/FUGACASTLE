@@ -19,7 +19,7 @@
 ---------------------------------------------------------------------
 local CFG = {
   -- Detecção
-  GUILDS_PADRAO     = "united front, matadordetraira",
+  GUILDS_PADRAO     = "united front",
   PALAVRAS_INVASAO  = { "castle", "invad", "invas" }, -- precisa conter UMA delas (ajuste com a mensagem real)
   EXIGIR_PALAVRA    = true,
   JANELA_MSG_MS     = 4000,    -- junta mensagens divididas dentro deste intervalo
@@ -53,7 +53,7 @@ if type(FugaCastleUserCfg) == "table" then
   for k, v in pairs(FugaCastleUserCfg) do CFG[k] = v end
 end
 
-local VERSAO = "1.0.0" -- aumente a cada atualização publicada
+local VERSAO = "1.0.1" -- aumente a cada atualização publicada
 
 -- Rota manual (opcional). Se você gravar waypoints pelos botões, a rota gravada tem prioridade.
 -- Campos: x, y, z | raio (tolerância, padrão 1) | tipo = "andar" (padrão) ou "usar" | item (id, para useWith)
