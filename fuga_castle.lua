@@ -48,6 +48,10 @@ local CFG = {
   DOMINIO_PALAVRAS      = { "domin", "conquist" }, -- a mensagem precisa conter UMA delas (ajuste com a mensagem real)
   DOMINIO_EXCLUIR       = { "invad", "invas" },    -- se conter qualquer uma, NÃO conta como domínio
 
+  -- Proteção contra morrer de novo: se morrer durante a invasão (fuga) ou até JANELA_MORTE_S segundos
+  -- depois de a hunt ter sido religada sozinha, o religar automático fica BLOQUEADO até você clicar em "Liberar hunt".
+  JANELA_MORTE_S        = 600,
+
   -- Auto-recarga: recarrega este script sozinho quando o arquivo for salvo (só com a fuga em HUNT NORMAL)
   AUTO_RECARGA          = false, -- só para o desenvolvedor testando o arquivo local; usuários usam o loader
   ARQUIVO               = "fuga_castle.lua", -- nome do arquivo dentro da pasta da config do bot
@@ -59,7 +63,7 @@ if type(FugaCastleUserCfg) == "table" then
   for k, v in pairs(FugaCastleUserCfg) do CFG[k] = v end
 end
 
-local VERSAO = "1.1.0" -- aumente a cada atualização publicada
+local VERSAO = "1.2.0" -- aumente a cada atualização publicada
 
 -- Rota manual (opcional). Se você gravar waypoints pelos botões, a rota gravada tem prioridade.
 -- Campos: x, y, z | raio (tolerância, padrão 1) | tipo = "andar" (padrão) ou "usar" | item (id, para useWith)
@@ -90,6 +94,7 @@ local S = storage.fugaCastle
 if S.ligado == nil then S.ligado = true end
 S.guilds = S.guilds or CFG.GUILDS_PADRAO
 S.rota = S.rota or {}
+if S.religarSeg == nil then S.religarSeg = 0 end -- segundos em segurança até religar sozinho (0 = manual)
 
 local function agora() return g_clock.millis() end
 
@@ -140,7 +145,7 @@ local TXT = {
   FUGINDO  = "FUGINDO",
   SEGURO   = "EM SEGURANÇA",
   FALHA    = "FUGA TRAVADA (assuma o controle)",
-  MORTO    = "PERSONAGEM MORREU",
+  MORTO    = "MORREU — hunt automática BLOQUEADA",
 }
 local COR = {
   NORMAL = "#9be29b", DETECTADA = "#ffd24d", FUGINDO = "#ff8c42",
@@ -148,6 +153,7 @@ local COR = {
 }
 
 local estado = "NORMAL"
+if S.bloqueado then estado = "MORTO" end -- morreu antes: continua bloqueado após relogar
 local R = {}          -- dados da fuga em andamento
 local snap = {}       -- estado do CaveBot/TargetBot antes da fuga
 local lblEstado, lblRota, btnLigar
@@ -177,7 +183,7 @@ local function atualizarUI()
 end
 
 local function ativa()
-  return estado == "DETECTADA" or estado == "FUGINDO" or estado == "SEGURO" or estado == "FALHA"
+  return estado == "DETECTADA" or estado == "FUGINDO" or estado == "SEGURO" or estado == "FALHA" or estado == "MORTO"
 end
 function FC.ativa() return ativa() end
 function FC.estado() return estado end
@@ -289,10 +295,17 @@ local function morto()
   return ok and r
 end
 
+local function religouRecente()
+  return S.religouEm and (os.time() - S.religouEm) <= CFG.JANELA_MORTE_S
+end
+
+-- Só conta como "morte da invasão" se ocorreu durante a fuga/segurança OU logo após a hunt ser religada sozinha.
 local function morreu()
   if estado == "MORTO" then return end
+  if not (ativa() or religouRecente()) then return end
+  S.bloqueado = true
   estado = "MORTO"
-  anunciar("PERSONAGEM MORREU DURANTE A FUGA")
+  anunciar("PERSONAGEM MORREU — hunt automática BLOQUEADA. Clique em 'Liberar hunt' quando quiser voltar.")
   atualizarUI()
 end
 
@@ -455,7 +468,7 @@ macro(50, function()
 end)
 
 macro(250, function()
-  if vivo() and estado == "FUGINDO" and morto() then morreu() end
+  if vivo() and morto() then morreu() end
 end)
 
 ---------------------------------------------------------------------
@@ -533,7 +546,7 @@ local function processar(texto, teste)
   -- A guild do domínio retomou o Castle: encerra a fuga e religa a hunt
   if ativa() and achouDominio(junto) then
     buf = {}
-    FC.liberar(true)
+    FC.liberar(true, "dominio")
     return
   end
 
@@ -576,7 +589,7 @@ end
 
 if onPlayerHealthChange then
   onPlayerHealthChange(function(pct)
-    if vivo() and pct and pct <= 0 and estado == "FUGINDO" then morreu() end
+    if vivo() and pct and pct <= 0 then morreu() end
   end)
 end
 
@@ -590,7 +603,9 @@ function FC.simular()
 end
 
 function FC.cancelar()
-  if estado == "NORMAL" then return end
+  if estado == "NORMAL" and not S.bloqueado then return end
+  S.bloqueado = false
+  S.religouEm = nil
   estado = "NORMAL"
   ultimoGatilho = -999999999
   religarMacros()
@@ -602,20 +617,46 @@ function FC.cancelar()
   atualizarUI()
 end
 
-function FC.liberar(religar)
-  if estado == "NORMAL" then return end
+function FC.liberar(religar, motivo)
+  if religar and S.bloqueado then
+    log("religar automático BLOQUEADO (personagem morreu); use 'Liberar hunt' manualmente")
+    return
+  end
+  if estado == "NORMAL" and not S.bloqueado then return end
+  if not religar then
+    S.bloqueado = false
+    S.religouEm = nil
+  end
   estado = "NORMAL"
   ultimoGatilho = -999999999
   religarMacros()
   if religar then
+    S.religouEm = os.time()
     if snap.cave and CaveBot and CaveBot.setOn then pcall(CaveBot.setOn) end
     if snap.target and TargetBot and TargetBot.setOn then pcall(TargetBot.setOn) end
-    anunciar("Castle dominado de novo pela " .. tostring(CFG.DOMINIO_GUILD) .. " — CaveBot/TargetBot religados")
+    if motivo == "dominio" then
+      anunciar("Castle dominado de novo pela " .. tostring(CFG.DOMINIO_GUILD) .. " — CaveBot/TargetBot religados")
+    else
+      anunciar("Tempo em segurança concluído — CaveBot/TargetBot religados")
+    end
   else
     anunciar("Hunt liberada manualmente — ligue o CaveBot/TargetBot quando quiser")
   end
   atualizarUI()
 end
+
+-- Timer: depois de X segundos em segurança, religa CaveBot/TargetBot (os que estavam ligados antes da fuga).
+-- Útil para ataque falso. Não religa se o personagem morreu (S.bloqueado).
+macro(500, function()
+  if not vivo() or estado ~= "SEGURO" or not R.seguroEm or S.bloqueado then return end
+  local seg = tonumber(S.religarSeg) or 0
+  if seg <= 0 then return end
+  local falta = math.ceil((seg * 1000 - (agora() - R.seguroEm)) / 1000)
+  if falta <= 0 then FC.liberar(true, "timer") return end
+  if lblEstado then
+    pcall(function() lblEstado:setText("Estado: EM SEGURANÇA (religa em " .. falta .. "s)") end)
+  end
+end)
 
 function FC.gravarWP()
   local p = posicao()
@@ -671,6 +712,8 @@ local function montarUI()
   lblEstado = reg(UI.Label(""))
   reg(UI.Label("Guilds monitoradas (separe por vírgula):"))
   reg(UI.TextEdit(S.guilds, function(_, texto) S.guilds = texto end))
+  reg(UI.Label("Religar hunt após X seg em segurança (0 = manual):"))
+  reg(UI.TextEdit(tostring(S.religarSeg), function(_, texto) S.religarSeg = tonumber(texto) or 0 end))
   reg(UI.Button("Testar fuga (simular invasão)", function() FC.simular() end))
   reg(UI.Button("Cancelar fuga", function() FC.cancelar() end))
   reg(UI.Button("Liberar hunt (manual)", function() FC.liberar() end))
@@ -734,6 +777,10 @@ end)
 
 local okUI, errUI = pcall(montarUI)
 if not okUI then log("falha ao montar a interface: " .. tostring(errUI)) end
+
+if S.bloqueado then
+  anunciar("Você morreu na última invasão — hunt automática BLOQUEADA. Clique em 'Liberar hunt (manual)' para reativar.")
+end
 
 ---------------------------------------------------------------------
 -- DIAGNÓSTICO (cole este bloco do console se algo não funcionar)
