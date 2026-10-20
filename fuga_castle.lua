@@ -42,6 +42,12 @@ local CFG = {
   RESTAURAR_AO_CANCELAR = true,
   DEBUG_LOG             = true,
 
+  -- Fim da invasão: quando esta guild dominar o Castle de novo, religa CaveBot/TargetBot sozinho
+  LIGAR_AO_DOMINIO      = true,
+  DOMINIO_GUILD         = "pvp covarde",
+  DOMINIO_PALAVRAS      = { "domin", "conquist" }, -- a mensagem precisa conter UMA delas (ajuste com a mensagem real)
+  DOMINIO_EXCLUIR       = { "invad", "invas" },    -- se conter qualquer uma, NÃO conta como domínio
+
   -- Auto-recarga: recarrega este script sozinho quando o arquivo for salvo (só com a fuga em HUNT NORMAL)
   AUTO_RECARGA          = false, -- só para o desenvolvedor testando o arquivo local; usuários usam o loader
   ARQUIVO               = "fuga_castle.lua", -- nome do arquivo dentro da pasta da config do bot
@@ -53,7 +59,7 @@ if type(FugaCastleUserCfg) == "table" then
   for k, v in pairs(FugaCastleUserCfg) do CFG[k] = v end
 end
 
-local VERSAO = "1.0.1" -- aumente a cada atualização publicada
+local VERSAO = "1.1.0" -- aumente a cada atualização publicada
 
 -- Rota manual (opcional). Se você gravar waypoints pelos botões, a rota gravada tem prioridade.
 -- Campos: x, y, z | raio (tolerância, padrão 1) | tipo = "andar" (padrão) ou "usar" | item (id, para useWith)
@@ -84,7 +90,6 @@ local S = storage.fugaCastle
 if S.ligado == nil then S.ligado = true end
 S.guilds = S.guilds or CFG.GUILDS_PADRAO
 S.rota = S.rota or {}
-if S.religarSeg == nil then S.religarSeg = 0 end -- segundos em segurança até religar sozinho (0 = nunca)
 
 local function agora() return g_clock.millis() end
 
@@ -498,6 +503,19 @@ local function achar(junto)
   return nil
 end
 
+local function achouDominio(junto)
+  if not CFG.LIGAR_AO_DOMINIO then return false end
+  local g = norm(CFG.DOMINIO_GUILD)
+  if g == "" or not string.find(junto, "guild:[" .. g .. "]", 1, true) then return false end
+  for _, k in ipairs(CFG.DOMINIO_EXCLUIR) do
+    if string.find(junto, norm(k), 1, true) then return false end
+  end
+  for _, k in ipairs(CFG.DOMINIO_PALAVRAS) do
+    if string.find(junto, norm(k), 1, true) then return true end
+  end
+  return false
+end
+
 local function processar(texto, teste)
   local t = agora()
   local n = norm(texto)
@@ -510,7 +528,16 @@ local function processar(texto, teste)
 
   local partes = {}
   for _, b in ipairs(buf) do partes[#partes + 1] = b.s end
-  local g = achar(table.concat(partes))
+  local junto = table.concat(partes)
+
+  -- A guild do domínio retomou o Castle: encerra a fuga e religa a hunt
+  if ativa() and achouDominio(junto) then
+    buf = {}
+    FC.liberar(true)
+    return
+  end
+
+  local g = achar(junto)
   if not g then return end
 
   local function ignorar(motivo)
@@ -583,24 +610,12 @@ function FC.liberar(religar)
   if religar then
     if snap.cave and CaveBot and CaveBot.setOn then pcall(CaveBot.setOn) end
     if snap.target and TargetBot and TargetBot.setOn then pcall(TargetBot.setOn) end
-    anunciar("Tempo em segurança concluído — CaveBot/TargetBot religados")
+    anunciar("Castle dominado de novo pela " .. tostring(CFG.DOMINIO_GUILD) .. " — CaveBot/TargetBot religados")
   else
     anunciar("Hunt liberada manualmente — ligue o CaveBot/TargetBot quando quiser")
   end
   atualizarUI()
 end
-
--- Timer: depois de X segundos em segurança, religa CaveBot/TargetBot (os que estavam ligados antes da fuga)
-macro(500, function()
-  if not vivo() or estado ~= "SEGURO" or not R.seguroEm then return end
-  local seg = tonumber(S.religarSeg) or 0
-  if seg <= 0 then return end
-  local falta = math.ceil((seg * 1000 - (agora() - R.seguroEm)) / 1000)
-  if falta <= 0 then FC.liberar(true) return end
-  if lblEstado then
-    pcall(function() lblEstado:setText("Estado: EM SEGURANÇA (religa em " .. falta .. "s)") end)
-  end
-end)
 
 function FC.gravarWP()
   local p = posicao()
@@ -656,8 +671,6 @@ local function montarUI()
   lblEstado = reg(UI.Label(""))
   reg(UI.Label("Guilds monitoradas (separe por vírgula):"))
   reg(UI.TextEdit(S.guilds, function(_, texto) S.guilds = texto end))
-  reg(UI.Label("Religar hunt após X seg em segurança (0 = manual):"))
-  reg(UI.TextEdit(tostring(S.religarSeg), function(_, texto) S.religarSeg = tonumber(texto) or 0 end))
   reg(UI.Button("Testar fuga (simular invasão)", function() FC.simular() end))
   reg(UI.Button("Cancelar fuga", function() FC.cancelar() end))
   reg(UI.Button("Liberar hunt (manual)", function() FC.liberar() end))
