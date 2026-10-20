@@ -34,9 +34,17 @@ local CFG = {
   RAIO_SEGURO       = 2,       -- distância do último waypoint para considerar seguro
   MAX_DIST          = 60,      -- distância máxima por trecho (mantenha waypoints a menos de ~40 sqm)
   STUCK_MS          = 2500,    -- sem se mover por este tempo = travado
-  TENTATIVAS_POR_WP = 3,
   PULOS_MAX         = 2,       -- quantos waypoints intermediários pode pular se travar
-  TEMPO_MAX_MS      = 300000,  -- tempo máximo total de fuga (5 min)
+  TEMPO_MAX_MS      = 0,       -- limite total da fuga em ms (0 = sem limite: nunca desiste)
+
+  -- Quando trava (sem andar por STUCK_MS) a fuga NÃO para: sobe de nível a cada travada
+  SPELL_FUGA             = "utana vid", -- "" para não usar
+  SPELL_FUGA_MANA        = 440,
+  SPELL_FUGA_COOLDOWN_MS = 30000,
+  SPELL_A_PARTIR         = 2,    -- tentativa em que usa a magia
+  ATACAR_BLOQUEIO        = true, -- ataca o monstro que está na frente
+  ATACAR_A_PARTIR        = 3,    -- tentativa em que começa a atacar
+  PULAR_APOS             = 5,    -- tentativa em que pode pular um waypoint intermediário
 
   CANCELAR_ATAQUE       = true,
   RESTAURAR_AO_CANCELAR = true,
@@ -63,7 +71,7 @@ if type(FugaCastleUserCfg) == "table" then
   for k, v in pairs(FugaCastleUserCfg) do CFG[k] = v end
 end
 
-local VERSAO = "1.2.0" -- aumente a cada atualização publicada
+local VERSAO = "1.3.0" -- aumente a cada atualização publicada
 
 -- Rota manual (opcional). Se você gravar waypoints pelos botões, a rota gravada tem prioridade.
 -- Campos: x, y, z | raio (tolerância, padrão 1) | tipo = "andar" (padrão) ou "usar" | item (id, para useWith)
@@ -233,7 +241,7 @@ local function guarda()
   for _, m in ipairs(macrosReg) do
     if macroLigada(m) then pcall(function() m.setOff() end) end
   end
-  if CFG.CANCELAR_ATAQUE then
+  if CFG.CANCELAR_ATAQUE and not (R.atacandoAte and g_clock.millis() < R.atacandoAte) then
     pcall(function() if g_game.isAttacking() then g_game.cancelAttack() end end)
   end
 end
@@ -368,6 +376,53 @@ local function usarTile(w)
   end)
 end
 
+local function sinal(n)
+  if n > 0 then return 1 elseif n < 0 then return -1 end
+  return 0
+end
+
+local ultimoSpellFuga = -999999999
+local function usarSpellFuga(t)
+  local sp = CFG.SPELL_FUGA
+  if not sp or sp == "" then return end
+  if t - ultimoSpellFuga < CFG.SPELL_FUGA_COOLDOWN_MS then return end
+  local ok, mana = pcall(function() return player:getMana() end)
+  if ok and mana and mana < CFG.SPELL_FUGA_MANA then return end
+  ultimoSpellFuga = t
+  pcall(say, sp)
+  log("usando '" .. sp .. "' para passar")
+end
+
+-- Ataca o monstro mais próximo do tile à frente (na direção do waypoint)
+local function atacarBloqueio(w, p, t)
+  if not CFG.ATACAR_BLOQUEIO then return end
+  local frente = { x = p.x + sinal(w.x - p.x), y = p.y + sinal(w.y - p.y), z = p.z }
+  local okL, lista = pcall(function() return g_map.getSpectators(p, false) end)
+  if not okL or not lista then return end
+  local melhor, md
+  for _, c in ipairs(lista) do
+    pcall(function()
+      if c:isMonster() then
+        local cp = c:getPosition()
+        if cp and cp.z == p.z and dist(p, cp) <= 2 then
+          local d = dist(cp, frente) * 10 + dist(p, cp)
+          if not md or d < md then melhor, md = c, d end
+        end
+      end
+    end)
+  end
+  if melhor then
+    R.atacandoAte = t + 4000
+    pcall(function() g_game.attack(melhor) end)
+    log("atacando o monstro que bloqueia a passagem")
+  end
+end
+
+local function desbloquear(w, p, t)
+  if R.tent >= CFG.SPELL_A_PARTIR then usarSpellFuga(t) end
+  if R.tent >= CFG.ATACAR_A_PARTIR then atacarBloqueio(w, p, t) end
+end
+
 local function resetWp(t, p)
   R.tent, R.usos = 0, 0
   R.ultimaPos, R.ultimoMov = p, t
@@ -378,7 +433,7 @@ local function tick()
   local t = agora()
   if morto() then morreu() return end
   guarda()
-  if t - R.inicio > CFG.TEMPO_MAX_MS then falha("tempo máximo excedido") return end
+  if CFG.TEMPO_MAX_MS > 0 and t - R.inicio > CFG.TEMPO_MAX_MS then falha("tempo máximo excedido") return end
   hasteTick(t)
 
   local r = rotaAtiva()
@@ -419,7 +474,6 @@ local function tick()
         R.ultimoUso = t
         R.usos = R.usos + 1
         usarTile(w)
-        if R.usos > 6 then falha("uso do item/tile sem efeito no waypoint " .. R.idx) return end
       end
       if R.usos >= 1 and not muda then
         if ultimo then concluir() return end
@@ -437,23 +491,25 @@ local function tick()
     -- muda == true e já está no tile, mas o andar não mudou: cai na lógica de travamento
   end
 
-  -- detecção de travamento
+  -- detecção de travamento: nunca desiste, só aumenta a insistência
   local u = R.ultimaPos
   if p.x ~= u.x or p.y ~= u.y or p.z ~= u.z then
     R.ultimaPos, R.ultimoMov = p, t
+    if R.posTravou and (p.z ~= R.posTravou.z or dist(p, R.posTravou) >= 3) then
+      R.tent, R.posTravou = 0, nil -- andou de verdade: recomeça a escada de tentativas
+    end
   elseif t - R.ultimoMov > CFG.STUCK_MS then
     R.ultimoMov = t
     R.tent = R.tent + 1
-    log("sem progresso no waypoint " .. R.idx .. " (tentativa " .. R.tent .. "/" .. CFG.TENTATIVAS_POR_WP .. ")")
-    if R.tent >= CFG.TENTATIVAS_POR_WP then
-      if prox and not muda and w.tipo ~= "usar" and prox.z == w.z and R.pulos < CFG.PULOS_MAX then
-        R.pulos = R.pulos + 1
-        R.idx = R.idx + 1
-        resetWp(t, p)
-        log("waypoint pulado (" .. R.pulos .. "/" .. CFG.PULOS_MAX .. ")")
-      else
-        falha("sem progresso no waypoint " .. R.idx)
-      end
+    R.posTravou = p
+    log("sem progresso no waypoint " .. R.idx .. " (tentativa " .. R.tent .. ")")
+    desbloquear(w, p, t)
+    if R.tent >= CFG.PULAR_APOS and prox and not muda and w.tipo ~= "usar"
+       and prox.z == w.z and R.pulos < CFG.PULOS_MAX then
+      R.pulos = R.pulos + 1
+      R.idx = R.idx + 1
+      resetWp(t, p)
+      log("waypoint pulado (" .. R.pulos .. "/" .. CFG.PULOS_MAX .. ")")
       return
     end
   end
